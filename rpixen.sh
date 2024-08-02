@@ -24,7 +24,7 @@ UBUNTUVERSION="20.04.3"
 
 BUILD_ARCH=${1:-arm64}
 
-sudo apt install device-tree-compiler tftpd-hpa flex bison qemu-utils kpartx git curl qemu-user-static binfmt-support parted bc libncurses5-dev libssl-dev pkg-config python acpica-tools wget gettext
+sudo apt install device-tree-compiler tftpd-hpa flex bison qemu-utils kpartx git curl qemu-user-static binfmt-support parted bc libncurses5-dev libssl-dev pkg-config python-is-python3 acpica-tools wget gettext
 
 source ${SCRIPTDIR}toolchain-aarch64-linux-gnu.sh
 
@@ -53,7 +53,9 @@ if [ ! -d firmware ]; then
 fi
 
 if [ ! -d xen ]; then
-    git clone --depth=1 --branch RELEASE-4.15.1 git://xenbits.xen.org/xen.git
+    git clone --depth=1 https://github.com/bryancrisso/xen-monitor
+    mv xen-monitor xen
+    #git clone --depth=1 --branch RELEASE-4.15.1 git://xenbits.xen.org/xen.git
 fi
 
 if [ ! -d linux ]; then
@@ -65,6 +67,7 @@ fi
 
 # Build xen
 if [ ! -s ${WRKDIR}xen/xen/xen ]; then
+    echo "Building Xen."
     cd ${WRKDIR}xen
     if [ ! -s xen/.config ]; then
         cat > xen/arch/arm/configs/rpi4_defconfig << EOF
@@ -191,7 +194,7 @@ unmountstuff () {
   sudo umount ${MNTROOTFS}sys || true
   sudo umount ${MNTROOTFS}tmp || true
   sudo umount ${MNTBOOT} || true
-  sudo umount ${MNTROOTFS} || true
+  sudo umount -l ${MNTROOTFS} || true
 }
 
 mountstuff () {
@@ -263,9 +266,9 @@ sudo cp -r bootfiles/* ${MNTBOOT}
 
 cd ${WRKDIR}linux
 if [ "${BUILD_ARCH}" == "arm64" ]; then
-    sudo --preserve-env PATH=${PATH} make O=.build-arm64 ARCH=arm64 CROSS_COMPILE=aarch64-none-linux-gnu- INSTALL_MOD_PATH=${MNTROOTFS} modules_install > ${WRKDIR}modules_install.log
+    sudo --preserve-env PATH=${PATH} make -j $(nproc) O=.build-arm64 ARCH=arm64 CROSS_COMPILE=aarch64-none-linux-gnu- INSTALL_MOD_PATH=${MNTROOTFS} modules_install > ${WRKDIR}modules_install.log
 elif [ "${BUILD_ARCH}" == "armhf" ]; then
-    sudo --preserve-env PATH=${PATH} make O=.build-arm32 ARCH=arm CROSS_COMPILE=arm-none-linux-gnueabihf- INSTALL_MOD_PATH=${MNTROOTFS} modules_install > ${WRKDIR}modules_install.log
+    sudo --preserve-env PATH=${PATH} make -j $(nproc) O=.build-arm32 ARCH=arm CROSS_COMPILE=arm-none-linux-gnueabihf- INSTALL_MOD_PATH=${MNTROOTFS} modules_install > ${WRKDIR}modules_install.log
 fi
 cd ${WRKDIR}
 
@@ -284,56 +287,14 @@ fi
 
 # Change the shared library symlinks to relative instead of absolute so they play nice with cross-compiling
 sudo chroot ${MNTROOTFS} symlinks -c /usr/lib/${LIB_PREFIX}/
+sudo mkdir ${MNTROOTFS}/xen
+sudo mount -o bind ${WRKDIR}xen ${MNTROOTFS}/xen
 
-cd ${WRKDIR}xen
+sudo chroot ${MNTROOTFS} sh -c 'apt install -y gettext iasl; cd /xen; XEN_ARCH=arm64 ./configure --enable-systemd --disable-xen --enable-tools --disable-docs --disable-stubdom --disable-golang --prefix=/usr --with-xenstored=xenstored'
+    
+sudo chroot ${MNTROOTFS} sh -c 'cd /xen; XEN_ARCH=arm64 make -j22 dist-tools'
 
-# TODO: --with-xenstored=oxenstored
-
-# Ask the native compiler what system include directories it searches through.
-SYSINCDIRS=$(echo $(sudo chroot ${MNTROOTFS} bash -c "echo | gcc -E -Wp,-v -o /dev/null - 2>&1" | grep "^ " | sed "s|^ /| -isystem${MNTROOTFS}|"))
-SYSINCDIRSCXX=$(echo $(sudo chroot ${MNTROOTFS} bash -c "echo | g++ -x c++ -E -Wp,-v -o /dev/null - 2>&1" | grep "^ " | sed "s|^ /| -isystem${MNTROOTFS}|"))
-
-CC="${CROSS_PREFIX}-gcc --sysroot=${MNTROOTFS} -nostdinc ${SYSINCDIRS} -B${MNTROOTFS}lib/${LIB_PREFIX} -B${MNTROOTFS}usr/lib/${LIB_PREFIX}"
-CXX="${CROSS_PREFIX}-g++ --sysroot=${MNTROOTFS} -nostdinc ${SYSINCDIRSCXX} -B${MNTROOTFS}lib/${LIB_PREFIX} -B${MNTROOTFS}usr/lib/${LIB_PREFIX}"
-LDFLAGS="-Wl,-rpath-link=${MNTROOTFS}lib/${LIB_PREFIX} -Wl,-rpath-link=${MNTROOTFS}usr/lib/${LIB_PREFIX}"
-
-PKG_CONFIG_LIBDIR=${MNTROOTFS}usr/lib/${LIB_PREFIX}/pkgconfig:${MNTROOTFS}usr/share/pkgconfig \
-PKG_CONFIG_SYSROOT_DIR=${MNTROOTFS} \
-LDFLAGS="${LDFLAGS}" \
-PYTHON=${MNTROOTFS}/usr/bin/python3 \
-./configure \
-    --with-system-qemu=/usr/bin/qemu-system-i386 \
-    --enable-systemd \
-    --disable-xen \
-    --enable-tools \
-    --disable-docs \
-    --disable-stubdom \
-    --disable-golang \
-    --prefix=/usr \
-    --with-xenstored=xenstored \
-    --build=x86_64-linux-gnu \
-    --host=${CROSS_PREFIX} \
-    CC="${CC}" \
-    CXX="${CXX}"
-
-PKG_CONFIG_LIBDIR=${MNTROOTFS}usr/lib/${LIB_PREFIX}/pkgconfig:${MNTROOTFS}usr/share/pkgconfig \
-PKG_CONFIG_SYSROOT_DIR=${MNTROOTFS} \
-LDFLAGS="${LDFLAGS}" \
-make dist-tools \
-    CROSS_COMPILE=${CROSS_PREFIX}- XEN_TARGET_ARCH=${XEN_ARCH} \
-    CC="${CC}" \
-    CXX="${CXX}" \
-    -j $(nproc)
-
-sudo --preserve-env PATH=${PATH} \
-PKG_CONFIG_LIBDIR=${MNTROOTFS}usr/lib/${LIB_PREFIX}/pkgconfig:${MNTROOTFS}usr/share/pkgconfig \
-PKG_CONFIG_SYSROOT_DIR=${MNTROOTFS} \
-LDFLAGS="${LDFLAGS}" \
-make install-tools \
-    CROSS_COMPILE=${CROSS_PREFIX}- XEN_TARGET_ARCH=${XEN_ARCH} \
-    CC="${CC}" \
-    CXX="${CXX}" \
-    DESTDIR=${MNTROOTFS}
+sudo chroot ${MNTROOTFS} sh -c 'cd /xen; XEN_ARCH=arm64 make -j22 install-tools'
 
 sudo chroot ${MNTROOTFS} systemctl enable xen-qemu-dom0-disk-backend.service
 sudo chroot ${MNTROOTFS} systemctl enable xen-init-dom0.service
